@@ -1,0 +1,201 @@
+---
+title: "Variação Valor Pago por Procedimento"
+author: "Rennis Sousa de Oliveira"
+date: "02/12/2019"
+output:
+  pdf_document: default
+  html_document: default
+  css: estilo.css
+---
+
+```{r setup, include=FALSE}
+require("knitr")
+knitr::opts_chunk$set(echo = TRUE)
+opts_knit$set(root.dir = "/home/rennisHD01/Projetos/R/rennis-r/outliers/procedimento")
+
+# Bibliotecas Utilizadas
+library(RPostgreSQL)
+library(tidyverse)
+library(doBy)
+library(magrittr)
+library(stringr)
+library(ggplot2)
+
+# Funcoes de Apoio
+if(!exists("formataReal", mode="function")) source("../../utils/util_formatacao.R")
+```
+
+
+```{r include=FALSE}
+drvPsql = RPostgreSQL::PostgreSQL()
+rm(pw);
+```
+
+**Extração do Modelo OLAP**  
+**Schema:** Plano Saude.mondrian.xml  
+**Cubo:** Procedimento  
+**Filtros Utilizados:**  
+  - Ano Referencia: 2018  
+  - Valor Unitário Minimo: Maior que R$ 0,10  
+  
+```{r}
+sqlProcedimento = "SELECT   cd_parceiro::varchar as cnpj
+                          , cd.cd_evento::varchar as procedimento
+                          , uf.sg_uf as uf
+                          , nm_valor_unitario as valor
+                  FROM public.ft_auditoria_pessoa_saude_procedimento ft
+                  JOIN dm_plano_saude_evento cd 
+                      ON ft.sk_plano_saude_evento = cd.sk_plano_saude_evento
+                  JOIN public.dm_plano_saude_parceiro pr 
+                      ON ft.sk_plano_saude_parceiro = pr.sk_plano_saude_parceiro
+                  JOIN public.vwm_dm_localidade_uf uf 
+                      ON sk_localidade_uf_prestador = sk_localidade
+                  JOIN public.vwm_dm_tempo_mensal tp 
+                      ON ft.sk_tempo_referencia = tp.sk_tempo
+                  where nm_valor_unitario > 0.10 AND nm_quantidade >= 1 AND tp.ano = 2018"
+
+df.sql <- dbGetQuery(cnxCoadminfo, statement = sqlProcedimento)
+df = df.sql
+```
+
+Estrutura dos dataset base da Analise  
+
+```{r}
+summary(df)
+```
+
+Prévia dos dados gerados  
+
+```{r}
+head(df)
+```
+
+ * Criando tabela referencia com valores de Mediana e Total Pago  
+ * As medias são calculadas no valor unitario do procedimento, não é considerado a quantidade
+ * Será analisado apenas procedimentos com somatorio total de incidência, maior que R$10.000,00
+ 
+```{r}
+# Consolidado com Indices
+df.referencia = summaryBy( valor ~ cnpj + uf+ procedimento, data = df.sql, FUN = list(median, sum))
+
+# Filtro Conteudo para reduzir o volume - > 10k
+# df.referencia = select(filter(df.referencia, valor.sum > 10000), procedimento, cnpj, uf,  valor.median, valor.sum)
+
+# Exibe Previa
+head(df.referencia)
+```
+
+Cruzamento da tabela de referencia (Mediana e Total) com a tabela de procedimento  
+
+```{r}
+# Join Tabela Referencia com Indices e Tablea com o grão de procedimentos
+df = inner_join(x = df, y = df.referencia
+                                      , by = c(  "procedimento" = "procedimento"
+                                               , "uf" = "uf"
+                                               , "cnpj" = "cnpj")
+                                )
+# Exibe Previa
+head(df)
+```
+
+Cria variaveis para compara diferenca e percentual e valores da mediana x valor cobrado por procedimento
+**Remover procedimentos que o valor pago foi igual a mediana
+
+```{r}
+# Calcula a diferença em R$ do valor cobrado no procedimento e a mediana
+df$diferenca.monetario = df$valor-df$valor.median
+
+# Calcula a diferença em % do valor cobrado no procedimento e a mediana
+df$diferenca.percentual = ((df$valor-df$valor.median)/df$valor.median)*100
+
+# Apenas com diferença de valor
+df.desvio = select(filter(df, diferenca.monetario != 0), procedimento, cnpj, uf, valor, valor.median, valor.sum, diferenca.monetario, diferenca.percentual)
+
+# Formatação númerica
+# Apenas com diferença de valor
+df.desvio = df %>% mutate_if(is.numeric, round, digits = 2)
+
+head(df)
+```
+
+
+Abordando um visão por prestador de serviço (CNPJ), analisando o impacto na diferença de valor se tivesse um valor por procedimento por ano
+```{r}
+# Consolidado com Indices
+df.prestador.dif = summaryBy( diferenca.monetario ~ cnpj + uf, data = df.desvio, FUN = list(sum))
+df.prestador.valor = summaryBy( valor ~ cnpj + uf, data = df.desvio, FUN = list(sum))
+df.prestador = inner_join(x = df.prestador.dif, y = df.prestador.valor, by = c("uf" = "uf", "cnpj" = "cnpj"))
+# Junta Informações
+df.prestador.desvio = select(filter(df.prestador, diferenca.monetario.sum > 30000), cnpj, uf, diferenca.monetario.sum, valor.sum)
+
+# Divisão por /100 para melhorar a visualizacao
+df.prestador.desvio$valor.sum = df.prestador.desvio$valor.sum/1000
+df.prestador.desvio$diferenca.monetario.sum = df.prestador.desvio$diferenca.monetario.sum/1000
+colnames(df.prestador.desvio)[1] <- "CNPJ"
+colnames(df.prestador.desvio)[2] <- "UF"
+colnames(df.prestador.desvio)[3] <- "Diferenca_Mediana"
+colnames(df.prestador.desvio)[4] <- "Total_Procedimento"
+head(df.prestador.desvio)  
+
+graf_disp = ggplot(df.prestador.desvio, aes(y=Total_Procedimento, x=Diferenca_Mediana)) +
+  geom_point(aes(col=UF)) + geom_smooth(method="loess", se = F) +
+  labs(subtitle = "Total em Procedimento x Diferença da Mediana  (Por CNPJ x UF) "
+       , x = "Diferença Total Mediana"
+       , y = "Total em Procedimento",
+       caption = "Valor Referência * R$ 10000 - Fonte: SGP")
+plot(graf_disp)
+```
+
+
+Analise do procedimento por UF
+```{r}
+head(df.desvio)
+df.uf.desvio = select(filter(df.desvio
+                              , diferenca.percentual > 10, valor.sum > 10000
+                              ), uf, procedimento, valor, valor.median, valor.sum, diferenca.monetario, diferenca.percentual)
+head(df.uf.desvio)
+
+# Valor Plot - Por Procedimento
+df.uf.desvio.procdimento = select(filter(df.desvio
+                              , procedimento == '30306027'
+                              ), uf, valor.median)
+ggplot(df.uf.desvio.procdimento, aes(x=uf, y=valor.median))+  geom_boxplot() + 
+ggtitle('Variação Procedimento UF')
+```
+
+
+Busca por variações entre o mesmo prestador, uf e procdimento com valores diferentes para cada procedimento
+
+```{r}
+# Parametro em percentual (%) para definir o limite que deseja filtra
+p_limite_desvio = 50
+df.alerta = select(filter(df.base.referencia, desvio.percentual > p_limite_desvio)
+                          , cd_cnpj, procedimento, sg_uf, valor
+                          , valor.median, valor.sum
+                          , desvio.percentual, desvio.monetario)
+# Ordena pelo maior valor pago pelo SERPRO no periodo
+df.alerta = df.alerta %>% arrange(desc(valor.sum))
+head(df.alerta)
+df.alerta.tratado = df.alerta %>%
+  rename("CNPJ" = "cd_cnpj") %>%
+  rename("Procedimento" = "procedimento") %>%
+  rename("UF" = "sg_uf") %>%
+  rename("Valor Unit" = "valor") %>%
+  rename("Valor Mediana" = "valor.median") %>%
+  rename("Total SERPRO" = "valor.sum") %>%
+  rename("% Desvio" = "desvio.percentual") %>%
+  rename("R$ Desvio" = "desvio.monetario")
+# Exibe Previa
+df.alerta.tratado$`Valor Unit` =  format_real(df.alerta.tratado$`Valor Unit`)
+df.alerta.tratado$`Valor Mediana` =  format_real(df.alerta.tratado$`Valor Mediana`)
+df.alerta.tratado$`Total SERPRO` =  format_real(df.alerta.tratado$`Total SERPRO`)
+df.alerta.tratado$`R$ Desvio` =  format_real(df.alerta.tratado$`R$ Desvio`)
+head(df.alerta.tratado)
+
+#Salva em CSV
+write.csv2(df.alerta.tratado, file = "ds_alerta_procedimento_prestador_uf.csv");
+view(df.alerta.tratado)
+```
+
+
+
